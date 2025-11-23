@@ -32,7 +32,7 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="""
-You are a friendly coffee shop barista for Blue Tokai Coffee.
+You are a friendly coffee shop barista for Starbucks coffee.
 
 The user is talking to you via voice.
 
