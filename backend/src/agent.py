@@ -2,10 +2,10 @@
 import logging
 import os
 import json
-import re
-import uuid
-import datetime
-from typing import Dict, Any, List, Optional
+import importlib
+import types
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 
@@ -14,6 +14,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
@@ -21,234 +22,268 @@ from livekit.agents import (
     tokenize,
     function_tool,
     RunContext,
-    MetricsCollectedEvent,
 )
-from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+# --- safe plugin importer -------------------------------------------------
+# Tries to import plugin modules but never raises at import-time. Instead
+# returns a lightweight proxy that raises helpful errors only when used.
+
+def _safe_import(name: str):
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        class _MissingProxy(types.SimpleNamespace):
+            def __init__(self, path):
+                super().__init__()
+                self.__path = path
+
+            def __getattr__(self, attr):
+                def _raise(*args, **kwargs):
+                    raise RuntimeError(
+                        f"Plugin '{self.__path}' is not available. Tried to access attribute '{attr}'.\n"
+                        f"Install the plugin (e.g. pip install <package>) or provide a real implementation."
+                    )
+                return _raise
+
+        return _MissingProxy(name)
+
+# Use safe imports for optional plugins (prevents ModuleNotFoundError at import time)
+plugins = _safe_import("livekit.plugins")
+murf = _safe_import("livekit.plugins.murf")
+silero = _safe_import("livekit.plugins.silero")
+google = _safe_import("livekit.plugins.google")
+deepgram = _safe_import("livekit.plugins.deepgram")
+noise_cancellation = _safe_import("livekit.plugins.noise_cancellation")
+turn_detector_multilingual = _safe_import("livekit.plugins.turn_detector.multilingual")
+
+# Try to grab MultilingualModel if available, otherwise set to None
+try:
+    MultilingualModel = getattr(turn_detector_multilingual, "MultilingualModel")
+except Exception:
+    MultilingualModel = None
+
+# ----------------------------------------------------------------------------
 
 logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
 
-# Load env vars from .env.local
 load_dotenv(".env.local")
 
-# ------- Paths & constants -------
+# ---------- Paths ----------
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "shared-data")
-os.makedirs(DATA_DIR, exist_ok=True)
+SHARED_DIR = os.path.join(BASE_DIR, "shared-data")
+os.makedirs(SHARED_DIR, exist_ok=True)
+CASE_PATH = os.path.join(SHARED_DIR, "fraud_cases.json")
 
-FAQ_FILE = os.path.join(DATA_DIR, "company_faq_lenskart.json")
-LEADS_FILE = os.path.join(DATA_DIR, "leads_lenskart.json")
+# ---------- Simple JSON DB helpers ----------
+def ensure_cases_file():
+    if not os.path.exists(CASE_PATH):
+        sample = [
+            {
+                "userName": "john",
+                "securityIdentifier": "ABC123",
+                "cardEnding": "4242",
+                "case": "pending_review",
+                "transactionName": "ABC Industry",
+                "transactionAmount": "₹2,450.00",
+                "transactionTime": "2025-11-20T14:12:00+05:30",
+                "transactionCategory": "e-commerce",
+                "transactionSource": "alibaba.com",
+                "location": "Delhi, India",
+                "security_question": "What is my favorite pet?",
+                "security_answer": "dog",
+                "outcome": "",
+                "last_updated": ""
+            }
+        ]
+        with open(CASE_PATH, "w", encoding="utf-8") as f:
+            json.dump(sample, f, indent=2, ensure_ascii=False)
 
-# Developer-uploaded screenshot (included in prompts / demo)
-FILE_URL = "/mnt/data/Screenshot 2025-11-22 222905.png"
 
-# ------- Ensure files exist & load FAQ -------
-DEFAULT_FAQ = {
-    "company": "Lenskart",
-    "overview": "Lenskart is India's leading eyewear brand offering eyeglasses, sunglasses, contact lenses, and home eye check-ups.",
-    "faq": [
-        {"q": "What products do you offer?", "a": "We offer prescription eyeglasses, sunglasses, contact lenses, powered sunglasses, and accessories. We also provide home eye check-ups."},
-        {"q": "Do you offer a free eye test?", "a": "Yes! Lenskart provides a free home eye test in multiple cities with certified optometrists."},
-        {"q": "What is your pricing?", "a": "Eyeglasses start from ₹499, premium collections from ₹1500+, sunglasses from ₹599, and contact lenses from ₹199 onwards."},
-        {"q": "Do you have a return or exchange policy?", "a": "Yes, Lenskart offers a 14-day no-questions-asked return or exchange policy on most products."},
-        {"q": "How fast is delivery?", "a": "Standard eyeglasses are delivered within 3–7 days. Contact lenses and ready stock items ship faster."},
-        {"q": "Do you have a free trial?", "a": "Yes! You can use the 3D Try-On on the app or website. Some frames also support Home Try-On."},
-        {"q": "Who is Lenskart for?", "a": "Anyone who wants stylish, durable eyewear — students, professionals, seniors, or kids."}
-    ]
-}
-
-def load_faq() -> Dict[str, Any]:
-    if not os.path.exists(FAQ_FILE):
-        with open(FAQ_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_FAQ, f, indent=2, ensure_ascii=False)
-        return DEFAULT_FAQ
-    with open(FAQ_FILE, "r", encoding="utf-8") as f:
+def load_cases() -> List[Dict[str, Any]]:
+    ensure_cases_file()
+    with open(CASE_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-FAQ = load_faq()
 
-def ensure_leads_file():
-    if not os.path.exists(LEADS_FILE):
-        with open(LEADS_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f, indent=2, ensure_ascii=False)
+def save_cases(cases: List[Dict[str, Any]]):
+    with open(CASE_PATH, "w", encoding="utf-8") as f:
+        json.dump(cases, f, indent=2, ensure_ascii=False)
 
-ensure_leads_file()
 
-# ------- Simple keyword FAQ lookup -------
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
+def find_case_by_username(username: str) -> Optional[Dict[str, Any]]:
+    username_normal = username.strip().lower()
+    cases = load_cases()
+    for c in cases:
+        if c.get("userName", "").strip().lower() == username_normal:
+            return c
+    return None
 
-def keyword_search_faq(query: str, top_n: int = 3) -> List[Dict[str, str]]:
-    qnorm = _normalize(query)
-    tokens = [t for t in re.split(r"\W+", qnorm) if t and len(t) > 2]
-    matches = []
-    overview = _normalize(FAQ.get("overview", ""))
-    if any(tok in overview for tok in tokens):
-        matches.append({"q": "About Lenskart", "a": FAQ.get("overview", "")})
-    for item in FAQ.get("faq", []):
-        cand = _normalize(item.get("q", "") + " " + item.get("a", ""))
-        if any(tok in cand for tok in tokens):
-            matches.append(item)
-    # dedupe and limit
-    seen = set()
-    out = []
-    for m in matches:
-        key = m.get("q", "")
-        if key not in seen:
-            out.append(m)
-            seen.add(key)
-        if len(out) >= top_n:
+
+def update_case_in_db(updated_case: Dict[str, Any]):
+    cases = load_cases()
+    changed = False
+    for idx, c in enumerate(cases):
+        if c.get("userName", "").strip().lower() == updated_case.get("userName", "").strip().lower():
+            cases[idx] = updated_case
+            changed = True
             break
-    if not out:
-        out = FAQ.get("faq", [])[:top_n]
-    return out
+    if not changed:
+        cases.append(updated_case)
+    save_cases(cases)
 
-# ------- Validators -------
-EMAIL_RE = re.compile(r"[^@]+@[^@]+\.[^@]+")
-def is_valid_email(e: str) -> bool:
-    return bool(EMAIL_RE.match((e or "").strip()))
+# ---------- Murf TTS helper (create TTS lazily) ----------
 
-# ------- Tools exposed to the LLM -------
+def get_tts():
+    """Return a murf.TTS instance if murf plugin is available, otherwise None."""
+    try:
+        # murf.TTS may raise if plugin missing or args invalid
+        return murf.TTS(
+            voice="en-US-matthew",
+            style="Conversation",
+            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            text_pacing=True,
+        )
+    except Exception as e:
+        logger.warning("Murf TTS not available: %s", e)
+        return None
+
+# ---------- Tools exposed to model ----------
 @function_tool
-async def find_faq(ctx: RunContext, question: str) -> Dict[str, Any]:
-    """Return top-matching FAQ entries. MUST be used for product/company questions."""
-    matches = keyword_search_faq(question)
-    return {"matches": matches}
-
-@function_tool
-async def fill_lead_field(ctx: RunContext, field: str, value: str) -> Dict[str, Any]:
-    """
-    Deterministically fill one lead field in session.userdata['lead'].
-    Use synonyms mapping; returns updated lead.
-    """
-    session = ctx.session
-    ud = getattr(session, "userdata", {})
-    lead = ud.get("lead", {"name": None, "email": None, "company": None, "role": None, "use_case": None, "team_size": None, "timeline": None})
-    f = field.strip().lower()
-    synonyms = {
-        "name": "name", "fullname": "name",
-        "email": "email", "e-mail": "email",
-        "company": "company", "org": "company",
-        "role": "role", "position": "role",
-        "usecase": "use_case", "use case": "use_case", "use_case": "use_case",
-        "team size": "team_size", "teamsize": "team_size", "team_size": "team_size",
-        "timeline": "timeline", "when": "timeline"
+async def get_case_by_username(ctx: RunContext, username: str) -> Dict[str, Any]:
+    c = find_case_by_username(username)
+    if not c:
+        return {"error": f"No fraud case found for username '{username}'."}
+    # safe projection (no sensitive fields)
+    return {
+        "userName": c.get("userName"),
+        "securityIdentifier": c.get("securityIdentifier"),
+        "cardEnding": c.get("cardEnding"),
+        "transactionName": c.get("transactionName"),
+        "transactionAmount": c.get("transactionAmount"),
+        "transactionTime": c.get("transactionTime"),
+        "location": c.get("location"),
+        "transactionSource": c.get("transactionSource"),
+        "transactionCategory": c.get("transactionCategory"),
+        "security_question": c.get("security_question"),
+        "case": c.get("case")
     }
-    f = synonyms.get(f, f)
-    lead[f] = value.strip()
-    ud["lead"] = lead
-    asked = ud.get("asked", [])
-    if f not in asked:
-        asked.append(f)
-        ud["asked"] = asked
-    session.userdata = ud
-    return {"lead": lead}
+
 
 @function_tool
-async def save_lead(ctx: RunContext, lead: Dict[str, Any]) -> Dict[str, str]:
-    """Persist lead to JSON and return ID."""
-    ensure_leads_file()
-    with open(LEADS_FILE, "r", encoding="utf-8") as f:
-        arr = json.load(f)
-    entry = dict(lead)
-    entry["_id"] = str(uuid.uuid4())[:8]
-    entry["created_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-    arr.append(entry)
-    with open(LEADS_FILE, "w", encoding="utf-8") as f:
-        json.dump(arr, f, indent=2, ensure_ascii=False)
-    return {"id": entry["_id"]}
+async def verify_answer(ctx: RunContext, username: str, answer: str) -> Dict[str, Any]:
+    c = find_case_by_username(username)
+    if not c:
+        return {"error": "case_not_found"}
+    correct = str(c.get("security_answer", "")).strip().lower()
+    given = str(answer).strip().lower()
+    ok = (given == correct)
+    return {"verified": ok, "case": {"userName": c.get("userName"), "case": c.get("case")}}
+
 
 @function_tool
-async def get_lead_summary(ctx: RunContext, lead: Dict[str, Any]) -> str:
-    """Return a compact spoken summary string for recap."""
-    name = lead.get("name") or "(unknown)"
-    email = lead.get("email") or "(unknown)"
-    use_case = lead.get("use_case") or "(not provided)"
-    team = lead.get("team_size") or "(unknown)"
-    timeline = lead.get("timeline") or "(unspecified)"
-    return f"{name} ({email}) is interested in {use_case}. Team size: {team}. Timeline: {timeline}."
+async def mark_case(ctx: RunContext, username: str, outcome: str, note: str) -> Dict[str, Any]:
+    c = find_case_by_username(username)
+    if not c:
+        return {"error": "case_not_found"}
+    c["case"] = outcome
+    c["outcome"] = note
+    c["last_updated"] = datetime.now(timezone.utc).isoformat()
+    update_case_in_db(c)
+    return {"result": "ok", "case": c}
 
-@function_tool
-async def ask_next_field(ctx: RunContext) -> Dict[str, Any]:
-    """
-    Server-side helper the LLM can call to get the next missing lead field and a suggested question.
-    Returns: {field: str, question: str, required: bool}
-    """
-    session = ctx.session
-    ud = getattr(session, "userdata", {})
-    lead = ud.get("lead", {"name": None, "email": None, "company": None, "role": None, "use_case": None, "team_size": None, "timeline": None})
-    order = ["name", "email", "company", "role", "use_case", "team_size", "timeline"]
-    labels = {
-        "name": "Could I get your full name?",
-        "email": "What's the best email to reach you at?",
-        "company": "Which company are you with (if any)?",
-        "role": "What's your role there?",
-        "use_case": "What would you use Lenskart for (e.g., team purchase, personal prescription, contact lenses)?",
-        "team_size": "How many people are in your team?",
-        "timeline": "What's your expected timeline? (now / soon / later)"
-    }
-    for f in order:
-        if not lead.get(f):
-            return {"field": f, "question": labels[f], "required": True}
-    # all present
-    return {"field": "", "question": "", "required": False}
-
-# ------- Murf TTS voices (session-level TTS intentionally NOT set) ------
-TTS_SDR = murf.TTS(
-    voice="en-US-matthew",
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
-
-# ------- SDR Agent class -------
-class LenskartSDRAgent(Agent):
-    def __init__(self):
-        instructions = f"""
-You are a friendly Lenskart SDR (voice-first). Use the provided tools—find_faq, fill_lead_field, ask_next_field, save_lead, get_lead_summary—to answer product questions and capture leads.
-
-Important rules:
-- For any product/company/pricing question, call `find_faq(question)` and answer ONLY using returned FAQ entries.
-- Fill lead fields deterministically using `fill_lead_field(field, value)`.
-- If you need to solicit missing lead data, call `ask_next_field()`; it returns a (field, question).
-- When all required fields are collected or the user says 'thanks' / 'that's all' / 'i'm done' / 'bye', call `save_lead(lead)` then `get_lead_summary(lead)` and speak the recap.
-- Keep responses short and polite, and confirm important values (e.g., repeat email back for confirmation).
-
-You can reference the demo screenshot at: {FILE_URL}
+# ---------- Agents ----------
+class FraudRouterAgent(Agent):
+    def __init__(self, **kwargs):
+        instructions = """
+You are a calm professional fraud-detection representative for a fictional bank.
+Ask the user for their username (non-sensitive). When you receive the username reply,
+the system has a tool `get_case_by_username` available; call it to load the case.
+If no case found, ask the user to re-check the username.
+If case found, ask the stored security question (from the tool response) to verify identity.
 """
-        super().__init__(instructions=instructions, tts=TTS_SDR)
+        # create TTS lazily; Agent accepts None for tts if not available
+        super().__init__(instructions=instructions, tts=get_tts(), **kwargs)
 
     async def on_enter(self) -> None:
-        greeting = (
-            f"Hi — welcome to {FAQ.get('company')}. I'm here to help with frames, sunglasses, contact lenses and home eye check-ups. "
-            "What brought you here today?"
-        )
-        await self.session.generate_reply(instructions=greeting)
+        await self.session.generate_reply(instructions=(
+            "Hello, this is the Fraud Department at Example Bank. We are calling about a suspicious transaction on your account. "
+            "To look up your case I need your username. Please say your username now."
+        ))
 
-# ------- Prewarm VAD -------
+
+class FraudCaseAgent(Agent):
+    def __init__(self, **kwargs):
+        instructions = """
+You are a calm fraud representative. Use tools:
+- get_case_by_username(username)
+- verify_answer(username, answer)
+- mark_case(username, outcome, note)
+
+Flow:
+1) Confirm username and call get_case_by_username to load the case.
+2) Ask the stored security question exactly as returned by the tool.
+3) Call verify_answer with the user's response.
+4) If verification fails: call mark_case(username, "verification_failed", "...") and say you cannot proceed.
+5) If verification succeeds: read transaction details and ask the user "Did you make this transaction?"
+6) If user says yes: call mark_case(username, "confirmed_safe", "...") and confirm.
+7) If user says no: call mark_case(username, "confirmed_fraud", "...") and explain mock actions.
+"""
+        super().__init__(instructions=instructions, tts=get_tts(), **kwargs)
+
+    async def on_enter(self) -> None:
+        await self.session.generate_reply(instructions=(
+            "Please confirm your username so I can load the suspicious transaction."
+        ))
+
+# ---------- Prewarm ----------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    try:
+        vad = silero.VAD.load()
+    except Exception as e:
+        logger.warning("Silero VAD not available: %s", e)
+        vad = None
+    proc.userdata["vad"] = vad
 
-# ------- Entrypoint -------
+# ---------- Entrypoint ----------
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
+    # create session WITHOUT default tts so individual agents' TTS are used
+    # instantiate optional components only if their plugins are available
+    try:
+        stt = deepgram.STT(model="nova-3")
+    except Exception as e:
+        logger.warning("Deepgram STT not available or failed to initialize: %s", e)
+        stt = None
+
+    try:
+        llm = google.LLM(model="gemini-2.5-flash")
+    except Exception as e:
+        logger.warning("Google LLM not available or failed to initialize: %s", e)
+        llm = None
+
+    if MultilingualModel is not None:
+        try:
+            turn_detection = MultilingualModel()
+        except Exception as e:
+            logger.warning("MultilingualModel instantiation failed: %s", e)
+            turn_detection = None
+    else:
+        turn_detection = None
+
+    vad = ctx.proc.userdata.get("vad")
+
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(model="gemini-2.5-flash"),
-        # DO NOT set session-level tts so agent-level TTS is used
-        turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
+        stt=stt,
+        llm=llm,
+        turn_detection=turn_detection,
+        vad=vad,
         preemptive_generation=True,
-        tools=[find_faq, fill_lead_field, ask_next_field, save_lead, get_lead_summary],
+        tools=[get_case_by_username, verify_answer, mark_case],
     )
 
-    # initialize deterministic lead state
-    session.userdata = {
-        "lead": {"name": None, "email": None, "company": None, "role": None, "use_case": None, "team_size": None, "timeline": None},
-        "asked": []
-    }
+    session.userdata = {}
 
     usage_collector = metrics.UsageCollector()
 
@@ -262,8 +297,16 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    await session.start(agent=LenskartSDRAgent(), room=ctx.room, room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()))
+    # Noise cancellation plugin call wrapped with try/except
+    bvc = None
+    try:
+        bvc = noise_cancellation.BVC()
+    except Exception as e:
+        logger.info("Noise cancellation not available: %s", e)
+
+    await session.start(agent=FraudRouterAgent(), room=ctx.room, room_input_options=RoomInputOptions(noise_cancellation=bvc))
     await ctx.connect()
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
